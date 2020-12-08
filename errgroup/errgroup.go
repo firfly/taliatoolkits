@@ -4,116 +4,45 @@ import (
 	"context"
 	"fmt"
 	"runtime"
-	"sync"
+
+	"golang.org/x/sync/errgroup"
 )
 
-// A Group is a collection of goroutines working on subtasks that are part of
-// the same overall task.
-//
-// A zero Group is valid and does not cancel on error.
+// Group 对 sync/errgroup 的简单封装，封装 context，新增方法 StopAll 以及在 Go 中对 panic 做 recover
+// 参考 https://github.com/go-kratos/kratos/blob/master/pkg/sync/errgroup/errgroup.go
 type Group struct {
-	err     error
-	wg      sync.WaitGroup
-	errOnce sync.Once
-
-	workerOnce sync.Once
-	ch         chan func(ctx context.Context) error
-	chs        []func(ctx context.Context) error
-
-	ctx    context.Context
-	cancel func()
+	ctx      context.Context
+	cancel   func()
+	rawGroup *errgroup.Group
 }
 
-// WithContext create a Group.
-// given function from Go will receive this context,
+// WithContext 新建一个 Group
 func WithContext(ctx context.Context) *Group {
-	return &Group{ctx: ctx}
+	c, f := context.WithCancel(ctx)
+	g, ctx := errgroup.WithContext(c)
+	return &Group{ctx: ctx, cancel: f, rawGroup: g}
 }
 
-// WithCancel create a new Group and an associated Context derived from ctx.
-//
-// given function from Go will receive context derived from this ctx,
-// The derived Context is canceled the first time a function passed to Go
-// returns a non-nil error or the first time Wait returns, whichever occurs
-// first.
-func WithCancel(ctx context.Context) *Group {
-	ctx, cancel := context.WithCancel(ctx)
-	return &Group{ctx: ctx, cancel: cancel}
-}
-
-func (g *Group) do(f func(ctx context.Context) error) {
-	ctx := g.ctx
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	var err error
-	defer func() {
-		if r := recover(); r != nil {
-			buf := make([]byte, 64<<10)
-			buf = buf[:runtime.Stack(buf, false)]
-			err = fmt.Errorf("errgroup: panic recovered: %s\n%s", r, buf)
-		}
-		if err != nil {
-			g.errOnce.Do(func() {
-				g.err = err
-				if g.cancel != nil {
-					g.cancel()
-				}
-			})
-		}
-		g.wg.Done()
-	}()
-	err = f(ctx)
-}
-
-// GOMAXPROCS set max goroutine to work.
-func (g *Group) GOMAXPROCS(n int) {
-	if n <= 0 {
-		panic("errgroup: GOMAXPROCS must great than 0")
-	}
-	g.workerOnce.Do(func() {
-		g.ch = make(chan func(context.Context) error, n)
-		for i := 0; i < n; i++ {
-			go func() {
-				for f := range g.ch {
-					g.do(f)
-				}
-			}()
-		}
+// Go 启动一个任务
+func (g *Group) Go(fn func(context context.Context) error) {
+	g.rawGroup.Go(func() (err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				buf := make([]byte, 64<<10)
+				buf = buf[:runtime.Stack(buf, false)]
+				err = fmt.Errorf("errgroup: panic recovered: %s\n%s", r, buf)
+			}
+		}()
+		return fn(g.ctx)
 	})
 }
 
-// Go calls the given function in a new goroutine.
-//
-// The first call to return a non-nil error cancels the group; its error will be
-// returned by Wait.
-func (g *Group) Go(f func(ctx context.Context) error) {
-	g.wg.Add(1)
-	if g.ch != nil {
-		select {
-		case g.ch <- f:
-		default:
-			g.chs = append(g.chs, f)
-		}
-		return
-	}
-	go g.do(f)
+// Wait 等待所有任务的完成
+func (g *Group) Wait() error {
+	return g.rawGroup.Wait()
 }
 
-// Wait blocks until all function calls from the Go method have returned, then
-// returns the first non-nil error (if any) from them.
-func (g *Group) Wait() error {
-	if g.ch != nil {
-		for _, f := range g.chs {
-			g.ch <- f
-		}
-	}
-	g.wg.Wait()
-	if g.ch != nil {
-		close(g.ch) // let all receiver exit
-	}
-	if g.cancel != nil {
-		g.cancel()
-	}
-	return g.err
+// StopAll 立刻结束所有的任务
+func (g *Group) StopAll() {
+	g.cancel()
 }
